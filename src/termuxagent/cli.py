@@ -22,7 +22,7 @@ BOLD = "\033[1m"
 
 MODES = {
     "chat": "Eres un asistente conversacional útil. Responde con claridad y en el idioma del usuario. No uses herramientas salvo que sean imprescindibles.",
-    "agent": "Eres TermuxAgent, un agente autónomo y cuidadoso. Resuelve tareas usando las herramientas disponibles; explica brevemente lo que haces. Antes de acciones con efectos externos, la herramienta pedirá permiso. Nunca afirmes que hiciste algo si falló.",
+    "agent": "Eres TermuxAgent, un agente autónomo y cuidadoso que se ejecuta con un modelo local. Resuelve tareas usando las herramientas disponibles; explica brevemente lo que haces. No envíes contenido a servicios remotos de IA. Antes de acciones con efectos externos, la herramienta pedirá permiso. Nunca afirmes que hiciste algo si falló.",
     "code": "Eres un agente experto en programación que trabaja en Termux. Inspecciona el workspace antes de cambiarlo, usa herramientas de forma segura, explica decisiones y prueba los cambios cuando sea posible.",
     "research": "Eres un asistente de investigación. Busca en la web, consulta fuentes y presenta una síntesis equilibrada con enlaces. Distingue hechos de incertidumbre y no inventes citas.",
     "creative": "Eres un colaborador creativo para texto, ideas, imágenes y video. Convierte peticiones vagas en propuestas concretas y usa las herramientas multimodales disponibles cuando el usuario lo pida.",
@@ -45,28 +45,31 @@ def _confirm(message: str) -> bool:
 
 def setup() -> int:
     config = Config.load()
-    _print("\n✦ Configuración de TermuxAgent", CYAN)
-    print("Usa una API compatible con OpenAI (por ejemplo OpenRouter). La clave se guarda solo en tu dispositivo.\n")
-    api_key = input("API key (deja vacío para usar TERMUXAGENT_API_KEY): ").strip()
-    if api_key:
-        config.values["api_key"] = api_key
-    config.values["base_url"] = input(f"URL API [{config.base_url}]: ").strip() or config.base_url
-    config.values["model"] = input(f"Modelo de chat [{config.model}]: ").strip() or config.model
-    config.values["image_model"] = input(f"Modelo de imagen [{config.image_model}]: ").strip() or config.image_model
-    print("\nVideo opcional: Replicate (se factura según el modelo usado). Déjalos vacíos para omitir.")
-    replicate = input("Token de Replicate: ").strip()
-    if replicate:
-        config.values["replicate_token"] = replicate
-        config.values["video_model"] = input("Modelo owner/name en Replicate [kwaivgi/kling-v2.1]: ").strip() or "kwaivgi/kling-v2.1"
-    tavily = input("Clave Tavily opcional para búsquedas web (vacío = DuckDuckGo): ").strip()
-    if tavily:
-        config.values["tavily_key"] = tavily
+    _print("\n✦ Configuración local de TermuxAgent", CYAN)
+    print("TermuxAgent no usa APIs de IA en la nube ni necesita API keys. Primero inicia llama-server en el teléfono.\n")
+    base_url = input(f"URL local de llama-server [{config.base_url}]: ").strip() or config.base_url
+    from urllib.parse import urlparse
+    if urlparse(base_url).hostname not in ("localhost", "127.0.0.1", "::1") or urlparse(base_url).scheme != "http":
+        _print("Solo se aceptan direcciones locales (localhost); se mantiene la dirección local predeterminada.", YELLOW)
+        base_url = "http://127.0.0.1:8080/v1"
+    config.values["base_url"] = base_url
+    config.values["model"] = input(f"Identificador del modelo cargado [{config.model}]: ").strip() or config.model
+    print("\nMultimedia opcional: ejecuta ComfyUI local y exporta workflows en formato API.")
+    comfy_url = input(f"URL local de ComfyUI [{config.comfyui_url}]: ").strip() or config.comfyui_url
+    parsed_comfy = urlparse(comfy_url)
+    if parsed_comfy.scheme != "http" or parsed_comfy.hostname not in ("localhost", "127.0.0.1", "::1"):
+        _print("ComfyUI también debe ejecutarse en localhost; se mantiene su dirección predeterminada.", YELLOW)
+        comfy_url = "http://127.0.0.1:8188"
+    config.values["comfyui_url"] = comfy_url
+    for kind, label in (("image", "imagen"), ("video", "video")):
+        config.values[f"{kind}_workflow"] = input(f"Ruta al workflow local de {label} (vacío para omitir): ").strip()
+        config.values[f"{kind}_prompt_node"] = input(f"ID del nodo de prompt para {label} (vacío para omitir): ").strip()
     workspace = input(f"Carpeta de trabajo [{config.workspace}]: ").strip()
     if workspace:
         config.values["workspace"] = str(Path(workspace).expanduser().resolve())
     config.save()
-    _print(f"\nConfiguración guardada en {CONFIG_FILE}", GREEN)
-    _print("La API key queda protegida con permisos de archivo 600. También puedes usar variables de entorno.\n", DIM)
+    _print(f"\nConfiguración local guardada en {CONFIG_FILE}", GREEN)
+    _print("No se guardan ni se envían claves de proveedores de IA.\n", DIM)
     return 0
 
 
@@ -74,9 +77,9 @@ def _welcome(config: Config) -> None:
     _print("""
 ╭──────────────────────────────────────────────╮
 │  ✦  T E R M U X A G E N T                    │
-│     IA multimodal · agente · Android          │
+│     IA local · agente · sin nube              │
 ╰──────────────────────────────────────────────╯""", CYAN)
-    print(f"  Modo: {MODE_LABELS.get(config.mode, config.mode)}  ·  Modelo: {config.model}")
+    print(f"  Modo: {MODE_LABELS.get(config.mode, config.mode)}  ·  Modelo local: {config.model}")
     print(f"  Workspace: {Path(config.workspace).expanduser()}\n")
     print("  Escribe una tarea o /help para ver comandos.  /quit para salir.\n")
 
@@ -157,7 +160,7 @@ Comandos:
   /quit                                       Salir
 
 Cada operación de escritura, shell, Android y generación multimedia pide confirmación.
-Los conectores trabajan dentro del workspace configurado. Las claves API nunca se muestran.
+La IA solo se ejecuta localmente; web/mensajería y otras herramientas conectan a servicios externos si las usas. No hay fallback a una IA en la nube.
 """)
             return True
         if cmd == "/mode":
@@ -222,7 +225,7 @@ def main(argv: list[str] | None = None) -> int:
         return setup()
     config = Config.load()
     if args.action == "config":
-        _print(f"Config: {CONFIG_FILE}\nWorkspace: {config.workspace}\nModelo: {config.model}\nConectores: {', '.join(config.connectors)}")
+        _print(f"Config: {CONFIG_FILE}\nEndpoint local: {config.base_url}\nModelo local: {config.model}\nComfyUI local: {config.comfyui_url}\nConectores: {', '.join(config.connectors)}")
         return 0
     if args.action == "chat" and args.mode:
         config.values["mode"] = args.mode
