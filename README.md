@@ -1,116 +1,129 @@
 # TermuxAgent ✦
 
-Un agente de IA **multimodal, modular y pensado para ejecutarse en Android con Termux**. Incluye chat y uso de herramientas, varios modos de trabajo, conectores para Android/web/GitHub/archivos, generación de imágenes y generación de video opcional. No requiere dependencias Python externas.
+Agente de inteligencia artificial diseñado para ejecutarse en Android/Termux **sin enviar prompts a proveedores de IA en la nube**. El chat y las decisiones del agente usan un servidor local `llama.cpp`; imágenes y videos pueden generarse con workflows locales de ComfyUI. No hay fallback a OpenAI, OpenRouter, Replicate ni Tavily.
 
-> La aplicación es el agente local; para conversar y generar medios necesitas configurar proveedores y sus propias API keys. Algunos proveedores cobran por uso. TermuxAgent no incluye ni comparte claves.
+## Importante: qué significa “nuestra IA”
+
+El código del agente y su configuración son de este proyecto y la inferencia se mantiene en el dispositivo. Para que responda, necesita pesos de un modelo de lenguaje en formato GGUF que tú eliges y descargas; TermuxAgent **no es un modelo fundacional entrenado desde cero**. Entrenar uno propio requiere datasets y mucha más capacidad de cómputo que un teléfono. Un modelo abierto usado localmente no envía las conversaciones a su proveedor.
 
 ## Instalación en Termux
 
-Instala [Termux desde F-Droid o GitHub](https://github.com/termux/termux-app) y ejecuta:
+1. Instala Termux desde F-Droid o GitHub y prepara las herramientas de compilación:
 
 ```sh
 pkg update -y
-pkg install -y python git
-# Opcional: acciones del teléfono (abrir enlaces, portapapeles, notificaciones, ubicación)
-pkg install -y termux-api
-python -m pip install --upgrade pip
+pkg install -y python git cmake clang make
+```
+
+2. Compila `llama.cpp` en el dispositivo y prepara una carpeta de modelos:
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp "$HOME/llama.cpp"
+cmake -S "$HOME/llama.cpp" -B "$HOME/llama.cpp/build" -DCMAKE_BUILD_TYPE=Release
+cmake --build "$HOME/llama.cpp/build" --config Release -j 2
+mkdir -p "$HOME/models"
+```
+
+Descarga manualmente un modelo **GGUF** compatible con `llama.cpp` y colócalo como `~/models/assistant.gguf`. Para usar herramientas en modo agente, elige un modelo instruct/chat con plantilla compatible con tool calling. El tamaño del modelo determina el uso de RAM, almacenamiento y velocidad. Empieza con un modelo cuantizado pequeño que sea compatible con la memoria disponible en tu teléfono.
+
+3. Inicia el servidor local (mantén esta sesión de Termux abierta):
+
+```sh
+"$HOME/llama.cpp/build/bin/llama-server" \
+  -m "$HOME/models/assistant.gguf" \
+  --host 127.0.0.1 --port 8080 -c 2048
+```
+
+4. En otra sesión de Termux instala y configura TermuxAgent:
+
+```sh
 python -m pip install git+https://github.com/lyanvalentinmail-prog/TermuxAgent.git
 termux-agent setup
 termux-agent
 ```
 
-Si instalas desde una copia del proyecto:
+El endpoint predeterminado es `http://127.0.0.1:8080/v1`. **Solo acepta localhost**: si el servidor local no está corriendo, el agente muestra un error y no intenta usar una IA remota.
+
+Para instalar desde una copia del repositorio:
 
 ```sh
 cd TermuxAgent
 python -m pip install .
-termux-agent setup
 ```
 
-Para dar acceso a archivos compartidos del teléfono, ejecuta `termux-setup-storage` en Termux y en `setup` elige `~/storage/shared` como carpeta de trabajo.
+## Imágenes y videos, también locales
 
-## Configuración del modelo
+La generación multimedia usa workflows de **ComfyUI local**, no una API de generación remota. Debes instalar/configurar ComfyUI en el dispositivo, descargar los modelos que necesite y guardar workflows en formato API. En `termux-agent setup` especifica la URL local de ComfyUI (por defecto `http://127.0.0.1:8188`), la ruta de cada workflow JSON y el ID del nodo que contiene el prompt. ComfyUI puede consumir bastante RAM, almacenamiento y batería; la generación de video local puede ser demasiado pesada para muchos teléfonos.
 
-El asistente de `termux-agent setup` solicita una API compatible con el formato OpenAI Chat Completions. La configuración queda en `~/.termuxagent/config.json` con permisos `600`. No guardes ese archivo en repositorios públicos. También puedes suministrar las claves mediante variables de entorno:
+Si no configuras workflows, chat y agente siguen funcionando, pero las herramientas de imagen/video informarán que no están listas. TermuxAgent solo llama al endpoint de ComfyUI en localhost. Para mantener la generación verdaderamente sin nube, usa workflows y nodos locales: algunos nodos personalizados de ComfyUI pueden conectarse a servicios externos por su cuenta.
+
+## Modos
+
+- **agent**: resuelve tareas usando las herramientas locales habilitadas.
+- **chat**: conversación sin herramientas.
+- **code**: programación sobre el workspace.
+- **research**: búsqueda web y síntesis; el modelo sigue siendo local.
+- **creative**: apoyo creativo con workflows locales de imagen/video.
 
 ```sh
-export TERMUXAGENT_API_KEY="..."
-export TERMUXAGENT_BASE_URL="https://openrouter.ai/api/v1"
-export TERMUXAGENT_MODEL="openai/gpt-4o-mini"
+termux-agent chat --mode research
+# dentro de la sesión:
+/mode creative
 ```
+
+## Conectores
+
+- **Archivos**: listar, leer y escribir dentro del workspace.
+- **Shell**: ejecutar comandos en Termux con aprobación explícita.
+- **Web**: DuckDuckGo HTML y lectura de páginas públicas (no usa un buscador con IA).
+- **GitHub**: búsqueda de repositorios/issues.
+- **Android/Termux:API**: abrir URL, portapapeles, compartir texto, notificación y ubicación.
+- **Telegram/Discord**: envío de mensajes si configuras credenciales, siempre con confirmación.
+- **ComfyUI local**: workflows locales de imagen/video.
+
+Los conectores pueden activarse/desactivarse en `connectors` dentro de `~/.termuxagent/config.json`. Aunque GitHub, web, Telegram y Discord necesitan conectividad con sus servicios, **no sustituyen ni reciben los prompts del modelo**; los mensajes que envíes a estos servicios se transmiten solo si invocas esas herramientas y apruebas la acción.
+
+Para algunas acciones Android, instala también la app Termux:API y el paquete:
+
+```sh
+pkg install -y termux-api
+termux-setup-storage  # opcional, para acceder al almacenamiento compartido
+```
+
+## Configuración
+
+`termux-agent setup` no pide ni guarda claves de IA. Archivo de configuración: `~/.termuxagent/config.json` (permisos 600).
 
 Variables opcionales:
 
 | Variable | Uso |
 |---|---|
-| `TERMUXAGENT_API_KEY` (o `OPENAI_API_KEY`) | Chat y generación de imágenes |
-| `TERMUXAGENT_BASE_URL` | Endpoint compatible con OpenAI |
-| `TERMUXAGENT_MODEL` | Modelo de chat/herramientas |
-| `TERMUXAGENT_IMAGE_MODEL` | Modelo de imágenes compatible con `/images/generations` |
-| `TERMUXAGENT_REPLICATE_TOKEN` | Generación de videos con Replicate |
-| `TERMUXAGENT_TAVILY_KEY` | Búsquedas web con Tavily; sin clave intenta DuckDuckGo |
-| `GITHUB_TOKEN` | Aumenta el límite de búsquedas de GitHub |
-| `TERMUXAGENT_HOME` | Cambia la carpeta privada de configuración |
-
-La generación de videos requiere además establecer `video_model` en `~/.termuxagent/config.json` con un modelo de Replicate compatible con entrada `prompt` y salida de video. La disponibilidad, parámetros y coste dependen del modelo. El agente pide confirmación antes de iniciar la generación.
-
-## Modos
-
-- **agent** (por defecto): delega tareas y utiliza conectores con confirmación cuando corresponde.
-- **chat**: conversación sencilla, sin herramientas.
-- **code**: ayuda de programación en el workspace, con herramientas de archivos y terminal.
-- **research**: investigación y síntesis apoyada en búsqueda web.
-- **creative**: ideas, escritura e imágenes/video.
-
-```sh
-termux-agent chat --mode research
-# o desde la sesión:
-/mode creative
-```
-
-## Conectores incluidos
-
-- **Archivos**: listar, leer y crear/editar archivos dentro del workspace.
-- **Shell de Termux**: comandos con autorización explícita.
-- **Web**: búsqueda (Tavily o alternativa DuckDuckGo) y lectura de páginas públicas.
-- **GitHub**: búsqueda de repositorios e issues/pull requests públicos.
-- **Telegram y Discord**: envío de mensajes con bot/chat o webhook configurados; pide autorización antes de enviar.
-- **Android/Termux:API**: abrir URL, portapapeles, compartir texto, notificación y ubicación (requiere permisos/utilidades de Termux:API).
-- **Imágenes**: genera y guarda PNG/JPG mediante endpoint OpenAI-compatible.
-- **Video**: genera y descarga MP4 mediante Replicate, si se configura.
-- **Utilidad**: fecha/hora local.
-
-Las herramientas se pueden habilitar/deshabilitar editando `connectors` en `~/.termuxagent/config.json`. Se pueden sumar conectores implementando nuevas herramientas en `src/termuxagent/tools.py`.
+| `TERMUXAGENT_LOCAL_URL` | Endpoint local de llama-server; solo localhost |
+| `TERMUXAGENT_LOCAL_MODEL` | Nombre del modelo cargado por el servidor |
+| `TERMUXAGENT_COMFYUI_URL` | Endpoint local de ComfyUI; solo localhost |
+| `GITHUB_TOKEN` | Aumenta el límite de búsqueda de GitHub |
+| `TERMUXAGENT_TELEGRAM_BOT_TOKEN` y `TERMUXAGENT_TELEGRAM_CHAT_ID` | Envío a Telegram |
+| `TERMUXAGENT_DISCORD_WEBHOOK` | Envío a Discord |
 
 ## Uso
 
-En la sesión interactiva escribe una tarea en lenguaje natural. Comandos disponibles:
-
 ```text
-/help                 Ayuda
-/mode agent           Cambiar modo
-/connectors           Ver conectores y herramientas activos
-/image un zorro...    Generar una imagen
-/video un paisaje...  Generar un video
-/clear                Nueva conversación
-/quit                 Salir
+/help                  Mostrar ayuda
+/mode agent            Cambiar modo
+/connectors            Ver conectores activos
+/image un zorro...     Generar imagen localmente
+/video un paisaje...   Generar video localmente
+/clear                 Limpiar conversación
+/quit                  Salir
 ```
 
-Los archivos generados se guardan en el workspace. También puedes ejecutar `termux-agent config` para ver configuración no secreta y `termux-agent --version` para consultar versión.
-
-## Seguridad y privacidad
-
-- Las acciones de escritura, shell, integración Android e imagen/video requieren confirmación en pantalla.
-- Los accesos de archivos se limitan al workspace configurado; lectura de archivos hasta 250 KB y salida acotada.
-- Comandos de shell se ejecutan en el dispositivo, no en un servidor remoto. Revisa el comando antes de aprobarlo; no apruebes órdenes que no entiendas.
-- La búsqueda y el modelo envían el texto necesario al proveedor seleccionado. No incluyas secretos en prompts.
-- Algunas acciones Android necesitan que instales la app **Termux:API**, otorgues permisos y ejecutes `pkg install termux-api`.
+Las escrituras, shell, Android, mensajes externos y generación multimedia piden confirmación. Los archivos se limitan al workspace configurado.
 
 ## Desarrollo
 
 ```sh
 python -m unittest discover -s tests -v
-python -m termuxagent --help
+python -m compileall -q src
 ```
 
 Licencia: MIT.

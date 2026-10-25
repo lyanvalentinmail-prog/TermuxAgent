@@ -1,16 +1,15 @@
 """Built-in connectors exposed to the agent as OpenAI-compatible function tools."""
 from __future__ import annotations
 
-import base64
 import html
 import ipaddress
 import json
 import os
 import re
-import shlex
 import shutil
 import socket
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,14 +28,29 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
 def _http(url: str, *, method: str = "GET", data: dict[str, Any] | None = None,
           headers: dict[str, str] | None = None, timeout: int = 30) -> bytes:
     body = json.dumps(data).encode() if data is not None else None
-    hdrs = {"User-Agent": "TermuxAgent/0.1 (+https://github.com/lyanvalentinmail-prog/TermuxAgent)"}
+    hdrs = {"User-Agent": "TermuxAgent/0.2-local"}
     if data is not None:
         hdrs["Content-Type"] = "application/json"
     if headers:
         hdrs.update(headers)
     req = urllib.request.Request(url, data=body, headers=hdrs, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as response:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+                return None
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    else:
+        opener = urllib.request.build_opener()
+    with opener.open(req, timeout=timeout) as response:
         return response.read()
+
+
+def _local_service_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "http" or parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+        raise ValueError("Las herramientas de generación solo se conectan a servidores locales en localhost.")
+    return url.rstrip("/")
 
 
 def _public_url(url: str) -> str:
@@ -93,20 +107,20 @@ class ToolRegistry:
         self.add("read_file", "Lee un archivo de texto dentro del workspace.", {"path": {"type": "string"}}, ["path"], self._read_file, "files")
         self.add("write_file", "Crea o reemplaza un archivo de texto. Siempre pide confirmación.", {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"], self._write_file, "files")
         self.add("run_command", "Ejecuta un comando de shell en Termux tras confirmación explícita. No usar para operaciones destructivas.", {"command": {"type": "string"}}, ["command"], self._run_command, "shell")
-        self.add("web_search", "Busca información en la web (Tavily si hay clave; DuckDuckGo como alternativa).", {"query": {"type": "string"}}, ["query"], self._web_search, "web")
+        self.add("web_search", "Busca información en la web (DuckDuckGo; sin proveedor de búsqueda con IA).", {"query": {"type": "string"}}, ["query"], self._web_search, "web")
         self.add("fetch_url", "Obtiene el texto de una página pública http(s), sin acceder a direcciones privadas.", {"url": {"type": "string"}}, ["url"], self._fetch_url, "web")
         self.add("github_search", "Busca repositorios públicos de GitHub.", {"query": {"type": "string"}}, ["query"], self._github_search, "github")
         self.add("github_issue_search", "Busca issues y pull requests públicos en GitHub.", {"query": {"type": "string"}}, ["query"], self._github_issue_search, "github")
         self.add("telegram_send", "Envía un mensaje a Telegram usando un bot y chat configurados. Siempre pide confirmación.", {"message": {"type": "string"}}, ["message"], self._telegram_send, "telegram")
         self.add("discord_send", "Envía un mensaje a un canal de Discord mediante un webhook configurado. Siempre pide confirmación.", {"message": {"type": "string"}}, ["message"], self._discord_send, "discord")
-        self.add("android_action",  "Usa utilidades opcionales de Termux: abrir URL, copiar texto, compartir texto, notificación o ubicación. Requiere Termux:API para algunas acciones.", {
+        self.add("android_action", "Usa utilidades opcionales de Termux: abrir URL, copiar texto, compartir texto, notificación o ubicación. Requiere Termux:API para algunas acciones.", {
             "action": {"type": "string", "enum": ["open_url", "clipboard", "share", "notify", "location"]},
             "text": {"type": "string", "description": "URL, texto, o título de notificación según acción"},
         }, ["action"], self._android_action, "android")
-        self.add("generate_image", "Genera una imagen con el proveedor OpenAI-compatible configurado y la guarda en el workspace.", {
+        self.add("generate_image", "Genera una imagen usando un workflow local de ComfyUI. No utiliza APIs ni modelos de IA en la nube.", {
             "prompt": {"type": "string"}, "filename": {"type": "string", "description": "Nombre .png/.jpg opcional"},
         }, ["prompt"], self._generate_image, "image")
-        self.add("generate_video", "Genera un video con Replicate (requiere TERMUXAGENT_REPLICATE_TOKEN y video_model configurado). Puede tardar varios minutos.", {
+        self.add("generate_video", "Genera un video con un workflow local de ComfyUI. No utiliza APIs ni modelos de IA en la nube.", {
             "prompt": {"type": "string"}, "filename": {"type": "string"},
         }, ["prompt"], self._generate_video, "video")
         self.add("current_time", "Devuelve fecha y hora local del dispositivo.", {}, [], lambda _: datetime.now().astimezone().isoformat(timespec="seconds"), "files")
@@ -161,10 +175,6 @@ class ToolRegistry:
 
     def _web_search(self, args: dict[str, Any]) -> str:
         query = args["query"][:400]
-        tavily = self.config.values.get("tavily_key")
-        if tavily:
-            data = json.loads(_http("https://api.tavily.com/search", method="POST", data={"api_key": tavily, "query": query, "max_results": 5}))
-            return "\n\n".join(f"{i+1}. {r.get('title','')}\n{r.get('url','')}\n{r.get('content','')}" for i, r in enumerate(data.get("results", []))) or "Sin resultados."
         url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({"q": query})
         page = _http(url).decode("utf-8", "replace")
         results = re.findall(r'<a rel="nofollow" class="result__a" href="(.*?)"[^>]*>(.*?)</a>', page, re.S)
@@ -175,7 +185,7 @@ class ToolRegistry:
             title = html.unescape(re.sub(r"<.*?>", "", title)).strip()
             snippet = html.unescape(re.sub(r"<.*?>", "", snippets[i])).strip() if i < len(snippets) else ""
             cleaned.append(f"{i+1}. {title}\n{link}\n{snippet}")
-        return "\n\n".join(cleaned) or "No se obtuvieron resultados. Configura TERMUXAGENT_TAVILY_KEY para usar Tavily."
+        return "\n\n".join(cleaned) or "No se obtuvieron resultados."
 
     def _fetch_url(self, args: dict[str, Any]) -> str:
         url = _public_url(args["url"])
@@ -246,63 +256,65 @@ class ToolRegistry:
         result = subprocess.run([binary, *extra], capture_output=True, text=True, timeout=60)
         return (result.stdout + result.stderr).strip()[:4000] or f"{action}: completado (exit={result.returncode})"
 
-    def _generate_image(self, args: dict[str, Any]) -> str:
-        api_key = self.config.values.get("api_key")
-        if not api_key:
-            raise ValueError("Configura primero una API key (setup).")
-        filename = args.get("filename") or "imagen-generada.png"
-        path = self._path(filename)
-        if path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
-            raise ValueError("Usa una extensión .png, .jpg o .webp.")
-        if not self.confirm(f"Generar imagen con el modelo {self.config.image_model} y guardarla en {path.name}."):
+    def _comfyui_generate(self, args: dict[str, Any], kind: str) -> str:
+        cfg = self.config.values
+        workflow_key = f"{kind}_workflow"
+        node_key = f"{kind}_prompt_node"
+        workflow_path = Path(str(cfg.get(workflow_key, ""))).expanduser()
+        if not str(cfg.get(workflow_key, "")).strip() or not workflow_path.is_file():
+            raise ValueError(f"Configura {workflow_key} con el workflow API de ComfyUI (archivo JSON local).")
+        node_id = str(cfg.get(node_key, "")).strip()
+        if not node_id:
+            raise ValueError(f"Configura {node_key} con el ID del nodo de texto/prompt en el workflow.")
+        workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+        node = workflow.get(node_id)
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            raise ValueError(f"El nodo {node_id} no existe o no tiene inputs en el workflow API.")
+        inputs = node["inputs"]
+        prompt_field = str(cfg.get(f"{kind}_prompt_field", ""))
+        if not prompt_field:
+            prompt_field = "text" if "text" in inputs else "prompt" if "prompt" in inputs else ""
+        if prompt_field not in inputs:
+            raise ValueError(f"No se encontró el campo de prompt. Configura {kind}_prompt_field en config.json.")
+        inputs[prompt_field] = args["prompt"]
+        endpoint = _local_service_url(str(cfg.get("comfyui_url", "")))
+        filename = args.get("filename") or ("imagen-generada.png" if kind == "image" else "video-generado.mp4")
+        output_path = self._path(filename)
+        allowed_extensions = (".png", ".jpg", ".jpeg", ".webp") if kind == "image" else (".mp4", ".webm", ".gif")
+        if output_path.suffix.lower() not in allowed_extensions:
+            raise ValueError(f"Extensión no admitida. Usa: {', '.join(allowed_extensions)}.")
+        if not self.confirm(f"Generar {kind} localmente con ComfyUI en el dispositivo. Esto puede tardar y usar mucha memoria."):
             return "Generación cancelada por el usuario."
-        url = self.config.base_url.rstrip("/") + "/images/generations"
-        payload = {"model": self.config.image_model, "prompt": args["prompt"], "n": 1, "size": "1024x1024"}
-        data = json.loads(_http(url, method="POST", data=payload, headers={"Authorization": f"Bearer {api_key}"}, timeout=180))
-        item = data["data"][0]
-        if item.get("b64_json"):
-            image = base64.b64decode(item["b64_json"])
-        elif item.get("url"):
-            image = _http(item["url"], timeout=120)
-        else:
-            raise ValueError("El proveedor no devolvió una imagen utilizable.")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(image)
-        return f"Imagen guardada: {path} ({len(image)} bytes)"
+        response = json.loads(_http(endpoint + "/prompt", method="POST", data={"prompt": workflow}, timeout=60))
+        prompt_id = response.get("prompt_id")
+        if not prompt_id:
+            raise RuntimeError(f"ComfyUI no aceptó el workflow: {str(response)[:600]}")
+        history_entry: dict[str, Any] | None = None
+        for _ in range(360):
+            time.sleep(2)
+            history = json.loads(_http(endpoint + "/history/" + urllib.parse.quote(str(prompt_id)), timeout=30))
+            history_entry = history.get(str(prompt_id))
+            if history_entry:
+                status = history_entry.get("status", {})
+                if status.get("status_str") in ("error", "interrupted"):
+                    raise RuntimeError("ComfyUI no pudo completar el workflow local.")
+                outputs = history_entry.get("outputs", {})
+                keys = ("images",) if kind == "image" else ("videos", "gifs", "images")
+                candidates = [(key, item) for output in outputs.values() for key in keys for item in output.get(key, [])]
+                if candidates:
+                    output_type, item = candidates[0]
+                    source_ext = Path(item.get("filename", "")).suffix.lower()
+                    if source_ext and output_path.suffix.lower() != source_ext:
+                        raise ValueError(f"El workflow produjo {source_ext}; cambia el nombre de salida para usar esa extensión.")
+                    params = urllib.parse.urlencode({"filename": item["filename"], "subfolder": item.get("subfolder", ""), "type": item.get("type", "output")})
+                    media = _http(endpoint + "/view?" + params, timeout=180)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_bytes(media)
+                    return f"{kind.capitalize()} guardado localmente: {output_path} ({len(media)} bytes)"
+        raise TimeoutError(f"Tiempo de espera agotado para el workflow local de ComfyUI ({prompt_id}).")
+
+    def _generate_image(self, args: dict[str, Any]) -> str:
+        return self._comfyui_generate(args, "image")
 
     def _generate_video(self, args: dict[str, Any]) -> str:
-        token = self.config.values.get("replicate_token")
-        model = self.config.values.get("video_model")
-        if not token or not model:
-            raise ValueError("Configura replicate_token y video_model (por ejemplo, owner/model-version de Replicate) en ~/.termuxagent/config.json.")
-        filename = args.get("filename") or "video-generado.mp4"
-        path = self._path(filename)
-        if path.suffix.lower() != ".mp4":
-            raise ValueError("El video debe guardarse con extensión .mp4.")
-        if not self.confirm(f"Enviar prompt al modelo de video Replicate {model}; puede incurrir en costes y tardar varios minutos."):
-            return "Generación cancelada por el usuario."
-        # Model identifier can be owner/name or owner/name:version; both are accepted by Replicate.
-        create_url = "https://api.replicate.com/v1/models/" + model + "/predictions"
-        headers = {"Authorization": f"Bearer {token}", "Prefer": "wait=60"}
-        response = json.loads(_http(create_url, method="POST", data={"input": {"prompt": args["prompt"]}}, headers=headers, timeout=90))
-        poll_url = response.get("urls", {}).get("get")
-        for _ in range(90):
-            if response.get("status") in ("succeeded", "failed", "canceled"):
-                break
-            if not poll_url:
-                break
-            import time
-            time.sleep(4)
-            req = urllib.request.Request(poll_url, headers={"Authorization": f"Bearer {token}", "User-Agent": "TermuxAgent/0.1"})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                response = json.loads(resp.read().decode())
-        if response.get("status") != "succeeded":
-            raise RuntimeError(f"La generación no terminó correctamente (estado: {response.get('status')}). Revisa tu historial en Replicate.")
-        output = response.get("output")
-        video_url = output[0] if isinstance(output, list) else output
-        if not isinstance(video_url, str):
-            raise RuntimeError("El modelo no devolvió una URL de video.")
-        video = _http(video_url, timeout=180)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(video)
-        return f"Video guardado: {path} ({len(video)} bytes)"
+        return self._comfyui_generate(args, "video")

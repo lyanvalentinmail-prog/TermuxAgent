@@ -6,21 +6,28 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 APP_DIR = Path(os.environ.get("TERMUXAGENT_HOME", Path.home() / ".termuxagent"))
 CONFIG_FILE = APP_DIR / "config.json"
 
 DEFAULTS: dict[str, Any] = {
-    "base_url": "https://openrouter.ai/api/v1",
-    "model": "openai/gpt-4o-mini",
-    "image_model": "openai/gpt-image-1",
-    "video_model": "",
+    "base_url": "http://127.0.0.1:8080/v1",
+    "model": "local-model",
+    "comfyui_url": "http://127.0.0.1:8188",
+    "image_workflow": "",
+    "video_workflow": "",
+    "image_prompt_node": "",
+    "video_prompt_node": "",
     "mode": "agent",
     "temperature": 0.7,
     "max_steps": 8,
     "workspace": str(Path.home()),
     "connectors": ["files", "shell", "web", "github", "android", "telegram", "discord", "image", "video"],
 }
+
+LEGACY_CLOUD_KEYS = ("api_key", "replicate_token", "tavily_key", "image_model", "video_model")
+
 
 @dataclass
 class Config:
@@ -29,23 +36,44 @@ class Config:
     @classmethod
     def load(cls) -> "Config":
         values = DEFAULTS.copy()
+        saved: dict[str, Any] = {}
         try:
             if CONFIG_FILE.exists():
-                saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-                if isinstance(saved, dict):
+                loaded = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    saved = loaded
                     values.update(saved)
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"No se pudo leer {CONFIG_FILE}: {exc}") from exc
-        # Environment variables take precedence, so secrets need not be stored in the file.
+
+        # Remove old provider credentials from disk and memory. They are never used by this local-only build.
+        migrated = any(key in saved for key in LEGACY_CLOUD_KEYS)
+        for key in LEGACY_CLOUD_KEYS:
+            values.pop(key, None)
+            saved.pop(key, None)
+
+        # Migrate old cloud endpoints to loopback so an upgrade cannot contact them.
+        parsed = urlparse(str(values.get("base_url", "")))
+        if parsed.scheme != "http" or parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+            values["base_url"] = DEFAULTS["base_url"]
+            values["model"] = DEFAULTS["model"]
+            if saved:
+                saved["base_url"] = DEFAULTS["base_url"]
+                saved["model"] = DEFAULTS["model"]
+            migrated = True
+
+        if migrated and CONFIG_FILE.exists():
+            CONFIG_FILE.write_text(json.dumps(saved, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            try:
+                CONFIG_FILE.chmod(0o600)
+            except OSError:
+                pass
+
+        # Inference endpoints supplied by the environment remain subject to the same loopback guard.
         env_map = {
-            "TERMUXAGENT_API_KEY": "api_key",
-            "OPENAI_API_KEY": "api_key",
-            "TERMUXAGENT_BASE_URL": "base_url",
-            "TERMUXAGENT_MODEL": "model",
-            "TERMUXAGENT_IMAGE_MODEL": "image_model",
-            "TERMUXAGENT_VIDEO_MODEL": "video_model",
-            "TERMUXAGENT_REPLICATE_TOKEN": "replicate_token",
-            "TERMUXAGENT_TAVILY_KEY": "tavily_key",
+            "TERMUXAGENT_LOCAL_URL": "base_url",
+            "TERMUXAGENT_LOCAL_MODEL": "model",
+            "TERMUXAGENT_COMFYUI_URL": "comfyui_url",
             "GITHUB_TOKEN": "github_token",
             "TERMUXAGENT_TELEGRAM_BOT_TOKEN": "telegram_bot_token",
             "TERMUXAGENT_TELEGRAM_CHAT_ID": "telegram_chat_id",
